@@ -2440,6 +2440,57 @@ class ModelTesterMixin(ExportTesterMixin):
 
             self.assertTrue(models_equal)
 
+    def test_resize_learned_position_embeddings(self):
+        """The default `resize_position_embeddings`, for models with a learned `embeddings.position_embeddings`."""
+        original_config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        tested = False
+        for model_class in self.all_model_classes:
+            model = model_class(copy.deepcopy(original_config)).to(torch_device).eval()
+            if type(model).resize_position_embeddings is not PreTrainedModel.resize_position_embeddings:
+                continue  # the model has its own implementation
+            _, position_embeddings = model._learned_position_embeddings()
+            if position_embeddings is None:
+                continue
+            tested = True
+            inputs = self._prepare_for_class(inputs_dict, model_class)
+            old_num = position_embeddings.num_embeddings
+            offset = 0 if position_embeddings.padding_idx is None else position_embeddings.padding_idx + 1
+            learned = position_embeddings.weight[offset:].detach().clone()
+            with torch.no_grad():
+                before = model(**inputs)
+
+            for mode in ("copy", "interpolate", "random"):
+                resized = copy.deepcopy(model)
+                resized.resize_position_embeddings(2 * old_num, mode=mode)
+                new_weight = resized.get_position_embeddings().weight
+                self.assertEqual(tuple(new_weight.shape), (2 * old_num, learned.shape[1]))
+                self.assertEqual(resized.config.max_position_embeddings, 2 * old_num)
+                if mode == "interpolate":
+                    # The learned positions are resampled; the reserved rows and both ends stay the same
+                    kept = [*range(offset), offset, 2 * old_num - 1]
+                    reference = [*range(offset), offset, old_num - 1]
+                    torch.testing.assert_close(new_weight[kept], position_embeddings.weight[reference])
+                else:
+                    torch.testing.assert_close(new_weight[:old_num], position_embeddings.weight, rtol=0, atol=0)
+                if mode == "copy":
+                    index = torch.arange(old_num - offset, 2 * old_num - offset, device=learned.device)
+                    torch.testing.assert_close(new_weight[old_num:], learned[index % learned.shape[0]], rtol=0, atol=0)
+                if mode != "interpolate":
+                    # Positions below the old limit keep their vectors, so the outputs don't change
+                    with torch.no_grad():
+                        after = resized(**inputs)
+                    torch.testing.assert_close(after[0], before[0], rtol=0, atol=0)
+
+            shrunk = copy.deepcopy(model)
+            shrunk.resize_position_embeddings(old_num - 1)
+            self.assertEqual(shrunk.get_position_embeddings().num_embeddings, old_num - 1)
+            self.assertEqual(shrunk.config.max_position_embeddings, old_num - 1)
+            torch.testing.assert_close(
+                shrunk.get_position_embeddings().weight, position_embeddings.weight[: old_num - 1], rtol=0, atol=0
+            )
+        if not tested:
+            self.skipTest(reason="Model does not use the default resize of learned absolute position embeddings")
+
     def test_resize_tokens_embeddings(self):
         if not self.test_resize_embeddings:
             self.skipTest(reason="test_resize_embeddings is set to `False`")

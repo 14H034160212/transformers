@@ -3093,17 +3093,111 @@ class PreTrainedModel(
         if has_new_lm_head_bias:
             new_lm_head.bias.data[:num_tokens_to_copy] = old_lm_head.bias.data[:num_tokens_to_copy]
 
-    def resize_position_embeddings(self, new_num_position_embeddings: int):
-        raise NotImplementedError(
-            f"`resize_position_embeddings` is not implemented for {self.__class__}`. To implement it, you should "
-            f"overwrite this method in the class {self.__class__} in `modeling_{self.__class__.__module__}.py`"
+    def _learned_position_embeddings(self) -> tuple[nn.Module, nn.Embedding] | tuple[None, None]:
+        """The `(embeddings, embeddings.position_embeddings)` pair of encoders with a learned absolute position table."""
+        embeddings = getattr(self.base_model, "embeddings", None)
+        position_embeddings = getattr(embeddings, "position_embeddings", None)
+        # Patch position tables of vision models are sized by the image grid, not by `max_position_embeddings`
+        if (
+            isinstance(position_embeddings, nn.Embedding)
+            and getattr(self.config, "max_position_embeddings", None) == position_embeddings.num_embeddings
+        ):
+            return embeddings, position_embeddings
+        return None, None
+
+    def resize_position_embeddings(self, new_num_position_embeddings: int, mode: str = "copy"):
+        """
+        Resizes the learned absolute position embeddings of the model (`embeddings.position_embeddings`) and updates
+        `config.max_position_embeddings`.
+
+        Models with another kind of position embedding override this method or don't support it.
+
+        Arguments:
+            new_num_position_embeddings (`int`):
+                The new number of rows of the position embedding matrix. Reducing it removes rows from the end.
+            mode (`str`, *optional*, defaults to `"copy"`):
+                How to initialize the rows added when the matrix grows:
+
+                - `"copy"`: position `i` reuses learned position `i mod L`, where `L` is the number of learned
+                  positions, as done to extend RoBERTa to 4096 positions in [Longformer](https://huggingface.co/papers/2004.05150).
+                - `"interpolate"`: linear interpolation of the learned positions to the new size.
+                - `"random"`: initialized like the rest of the model's weights.
+
+                Rows reserved before the first learned position (positions start at `padding_idx + 1` when the
+                embedding has a `padding_idx`, as in RoBERTa) are kept as they are.
+        """
+        embeddings, old_embeddings = self._learned_position_embeddings()
+        if old_embeddings is None:
+            raise NotImplementedError(
+                f"`resize_position_embeddings` is not implemented for {self.__class__}`. To implement it, you should "
+                f"overwrite this method in the class {self.__class__} in `modeling_{self.__class__.__module__}.py`"
+            )
+        if mode not in ("copy", "interpolate", "random"):
+            raise ValueError(f"`mode` should be one of 'copy', 'interpolate' or 'random', got {mode!r}.")
+        old_num, dim = old_embeddings.weight.shape
+        if new_num_position_embeddings == old_num:
+            return
+
+        padding_idx = old_embeddings.padding_idx
+        offset = 0 if padding_idx is None else padding_idx + 1
+        if new_num_position_embeddings <= offset:
+            raise ValueError(
+                f"`new_num_position_embeddings` should be larger than {offset}, the number of reserved positions."
+            )
+        old_weight = old_embeddings.weight.data
+        new_embeddings = nn.Embedding(
+            new_num_position_embeddings,
+            dim,
+            padding_idx=padding_idx,
+            device=old_weight.device,
+            dtype=old_weight.dtype,
         )
+        self._init_weights(new_embeddings)
+        with torch.no_grad():
+            new_weight = new_embeddings.weight
+            num_to_copy = min(old_num, new_num_position_embeddings)
+            new_weight[:num_to_copy] = old_weight[:num_to_copy]
+            if new_num_position_embeddings > old_num:
+                learned = old_weight[offset:]
+                if mode == "copy":
+                    index = torch.arange(old_num - offset, new_num_position_embeddings - offset, device=learned.device)
+                    new_weight[old_num:] = learned[index % learned.shape[0]]
+                elif mode == "interpolate":
+                    resized = nn.functional.interpolate(
+                        learned.T.unsqueeze(0).float(),
+                        size=new_num_position_embeddings - offset,
+                        mode="linear",
+                        align_corners=True,
+                    )
+                    new_weight[offset:] = resized[0].T.to(new_weight.dtype)
+        new_embeddings.weight.requires_grad_(old_embeddings.weight.requires_grad)
+        embeddings.position_embeddings = new_embeddings
+
+        # Buffers sized by `max_position_embeddings`, e.g. `position_ids` and `token_type_ids` in BERT-like embeddings
+        for name in ("position_ids", "token_type_ids"):
+            buffer = embeddings._buffers.get(name)
+            if buffer is None or buffer.shape[-1] != old_num:
+                continue
+            persistent = name not in embeddings._non_persistent_buffers_set
+            if name == "position_ids":
+                new_buffer = torch.arange(new_num_position_embeddings, dtype=buffer.dtype, device=buffer.device)
+            else:
+                new_buffer = buffer.new_zeros(new_num_position_embeddings)
+            embeddings.register_buffer(name, new_buffer.expand((1, -1)), persistent=persistent)
+
+        logger.info(f"Setting `config.max_position_embeddings={new_num_position_embeddings}`...")
+        self.config.max_position_embeddings = new_num_position_embeddings
+        if self.base_model is not self:
+            self.base_model.config.max_position_embeddings = new_num_position_embeddings
 
     def get_position_embeddings(self) -> nn.Embedding | tuple[nn.Embedding]:
-        raise NotImplementedError(
-            f"`get_position_embeddings` is not implemented for {self.__class__}`. To implement it, you should "
-            f"overwrite this method in the class {self.__class__} in `modeling_{self.__class__.__module__}.py`"
-        )
+        _, position_embeddings = self._learned_position_embeddings()
+        if position_embeddings is None:
+            raise NotImplementedError(
+                f"`get_position_embeddings` is not implemented for {self.__class__}`. To implement it, you should "
+                f"overwrite this method in the class {self.__class__} in `modeling_{self.__class__.__module__}.py`"
+            )
+        return position_embeddings
 
     def init_weights(self):
         """
