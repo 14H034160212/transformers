@@ -1029,6 +1029,15 @@ class ModelTesterMixin(ExportTesterMixin):
                         else:
                             self.assertTrue(param.dtype == torch.bfloat16, f"{name} was upcasted but it should NOT be")
 
+                    # `from_config` should keep the same modules in fp32 as `from_pretrained`
+                    for dtype in (torch.float16, torch.bfloat16):
+                        expected = model_class.from_pretrained(tmpdirname, dtype=dtype).state_dict()
+                        model = model_class._from_config(copy.deepcopy(config), dtype=dtype)
+                        for name, param in model.state_dict().items():
+                            self.assertEqual(
+                                param.dtype, expected[name].dtype, f"{name} with `from_config` in {dtype}"
+                            )
+
     def test_save_load_keys_to_ignore_on_save(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 

@@ -51,6 +51,7 @@ from .conversion_mapping import get_model_conversion_mapping
 from .core_model_loading import (
     WeightConverter,
     WeightRenaming,
+    build_glob_alternation,
     convert_and_load_state_dict_in_model,
     revert_weight_conversion,
 )
@@ -1452,6 +1453,11 @@ class PreTrainedModel(
         with ContextManagers(init_contexts):
             model = cls(config, **kwargs)
             patch_output_recorders(model)
+
+        # Keep the same modules in fp32 as `from_pretrained` does with the `keep_in_fp32` flags. Under ZeRO-3 the
+        # parameters are already partitioned, so they are left as they are
+        if dtype is not None and not needs_zero3_init:
+            model._apply_dtype_plan(model._get_dtype_plan(dtype))
 
         # Under ZeRO-3, parameters were partitioned into empty tensors during construction,
         # so weight init was suppressed. Re-initialize using the ZeRO-3 variant which gathers
@@ -3856,6 +3862,31 @@ class PreTrainedModel(
             dtype_plan.update(dict.fromkeys(self._keep_in_fp32_modules_strict, torch.float32))
 
         return dtype_plan
+
+    def _apply_dtype_plan(self, dtype_plan: dict):
+        """
+        Cast the floating-point parameters and buffers matching `dtype_plan` (see `_get_dtype_plan`) in place. Names are
+        matched the same way as when loading a checkpoint.
+        """
+        if not dtype_plan:
+            return
+        dtype_policy_alt, dtype_policy_by_group_name, _ = build_glob_alternation(list(dtype_plan.keys()))
+        for module_name, module in self.named_modules():
+            for tensors in (module._parameters, module._buffers):
+                for name, tensor in tensors.items():
+                    if tensor is None or not tensor.is_floating_point():
+                        continue
+                    full_name = f"{module_name}.{name}" if module_name else name
+                    if (match := dtype_policy_alt.search(full_name)) is None:
+                        continue
+                    target_dtype = dtype_plan[dtype_policy_by_group_name[match.lastgroup]]
+                    if tensor.dtype == target_dtype:
+                        continue
+                    if isinstance(tensor, nn.Parameter):
+                        # Keep the same `Parameter` object, so that tied weights stay tied
+                        tensor.data = tensor.data.to(target_dtype)
+                    else:
+                        tensors[name] = tensor.to(target_dtype)
 
     def set_use_kernels(self, use_kernels, kernel_config: KernelConfig | None = None, mode: "Mode | None" = None):
         """
